@@ -1,0 +1,14 @@
+# Security & Credentials
+.env
+
+# Python files
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Project local state and data
+session_state.json
+data/

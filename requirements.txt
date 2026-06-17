@@ -1,0 +1,10 @@
+gpiozero==2.0.1
+colorzero==2.0.0
+opencv-python-headless==4.9.0.80
+customtkinter==5.2.2
+pillow==10.2.0
+paramiko
+
+# Note: If running on a Raspberry Pi, it is highly recommended to install 
+# OpenCV via `sudo apt install python3-opencv` instead of pip.
+# Similarly for gpiozero: `sudo apt install python3-gpiozero`
