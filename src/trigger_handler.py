@@ -1,5 +1,17 @@
 import time
-from gpiozero import DigitalInputDevice, DigitalOutputDevice
+try:
+    from gpiozero import DigitalInputDevice, DigitalOutputDevice
+    HAS_GPIO = True
+except ImportError:
+    HAS_GPIO = False
+    class MockGPIO:
+        def __init__(self, *args, **kwargs):
+            self.when_activated = None
+        def on(self): pass
+        def off(self): pass
+    DigitalInputDevice = MockGPIO
+    DigitalOutputDevice = MockGPIO
+
 
 class TriggerHandler:
     """

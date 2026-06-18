@@ -13,7 +13,7 @@ CONFIRM_OUTPUT_PIN = 27   # Pi → UR10e: "Image saved, you may move"
 PRODUCT_DONE_PIN   = 22   # UR10e → Pi: "Product cycle complete"
 
 # ─── Camera ───────────────────────────────────────────────────────────────────
-CAMERA_INDEX       = 1    # /dev/video1 on this Pi (Microdia USB 2.0 Camera)
+CAMERA_INDEX       = 0    # Default camera index (/dev/video0). If incorrect, system will auto-scan.
 
 # ─── Data Storage ─────────────────────────────────────────────────────────────
 BASE_SAVE_DIR      = "data/captured_images"
@@ -53,22 +53,33 @@ def load_state():
 def main():
     print("Starting Weld Inspection Monitor...")
 
-    msg_queue = queue.Queue()
+    ui_to_main_queue = queue.Queue()
+    main_to_ui_queue = queue.Queue()
 
-    # 1. Camera
     camera = CameraCapture(camera_index=CAMERA_INDEX)
+    if camera.is_open():
+        if camera.camera_index != CAMERA_INDEX:
+            main_to_ui_queue.put(('log', f"[SYSTEM] Configured camera index {CAMERA_INDEX} failed. Auto-detected and using index {camera.camera_index}."))
+        else:
+            main_to_ui_queue.put(('log', f"[SYSTEM] Camera opened at index {camera.camera_index}."))
+    else:
+        main_to_ui_queue.put(('log', f"[ERROR] Could not open camera at index {CAMERA_INDEX} or any fallback indices."))
 
     # 2. Check for an existing session to resume
     saved = load_state()
     if saved:
-        msg_queue.put(('resume_hint', (saved["product_name"], saved["product_num"])))
+        main_to_ui_queue.put(('resume_hint', (saved["product_name"], saved["product_num"])))
 
     # ─── Callbacks (called from gpiozero background thread) ───────────────────
 
     def on_robot_trigger() -> bool:
         """Fires when UR10e sends capture signal on BCM 17."""
         if not session["active"]:
-            msg_queue.put(('log', "[WARNING] Trigger received but no session is active. Start a session first."))
+            main_to_ui_queue.put(('log', "[WARNING] Trigger received but no session is active. Start a session first."))
+            return False
+
+        if not camera.is_open():
+            main_to_ui_queue.put(('log', "[WARNING] Capture trigger received but camera is closed!"))
             return False
 
         weld_dir = os.path.join(
@@ -77,7 +88,7 @@ def main():
             f"weldpoint_{session['weld_index']:02d}"
         )
 
-        msg_queue.put(('log', f"[TRIGGER] Capturing → {weld_dir}"))
+        main_to_ui_queue.put(('log', f"[TRIGGER] Capturing → {weld_dir}"))
 
         success, filepath, img = camera.capture_image(
             save_dir    = weld_dir,
@@ -85,18 +96,18 @@ def main():
         )
 
         if success:
-            msg_queue.put(('log', f"[SUCCESS] Saved: {os.path.basename(filepath)}"))
-            msg_queue.put(('image', img))
+            main_to_ui_queue.put(('log', f"[SUCCESS] Saved: {os.path.basename(filepath)}"))
+            main_to_ui_queue.put(('image', img))
 
             # Advance weld index and persist
             session["weld_index"] += 1
             save_state()
-            msg_queue.put(('status', (session["product_name"],
+            main_to_ui_queue.put(('status', (session["product_name"],
                                        session["product_num"],
                                        session["weld_index"])))
             return True
         else:
-            msg_queue.put(('log', "[ERROR] Capture failed."))
+            main_to_ui_queue.put(('log', "[ERROR] Capture failed."))
             return False
 
     def on_product_done():
@@ -109,8 +120,8 @@ def main():
         session["weld_index"]    = 1
         save_state()
 
-        msg_queue.put(('log', f"[DONE] Product #{old_num:03d} complete → starting #{session['product_num']:03d}"))
-        msg_queue.put(('status', (session["product_name"],
+        main_to_ui_queue.put(('log', f"[DONE] Product #{old_num:03d} complete → starting #{session['product_num']:03d}"))
+        main_to_ui_queue.put(('status', (session["product_name"],
                                    session["product_num"],
                                    session["weld_index"])))
 
@@ -123,44 +134,39 @@ def main():
             capture_callback      = on_robot_trigger,
             product_done_callback = on_product_done,
         )
-        msg_queue.put(('log', f"[INIT] GPIO ready — Capture=BCM{TRIGGER_INPUT_PIN}, "
-                              f"Confirm=BCM{CONFIRM_OUTPUT_PIN}, Done=BCM{PRODUCT_DONE_PIN}"))
+        main_to_ui_queue.put(('log', f"[INIT] GPIO ready — Capture=BCM{TRIGGER_INPUT_PIN}, "
+                                     f"Confirm=BCM{CONFIRM_OUTPUT_PIN}, Done=BCM{PRODUCT_DONE_PIN}"))
     except Exception as e:
-        msg_queue.put(('log', f"[WARNING] GPIO init failed (expected if not on Pi): {e}"))
+        main_to_ui_queue.put(('log', f"[WARNING] GPIO init failed (expected if not on Pi): {e}"))
 
     # 4. Build UI
-    app = WeldMonitoringUI(msg_queue)
+    app = WeldMonitoringUI(main_to_ui_queue, ui_to_main_queue)
 
     # 5. Live video feed thread
     is_running = True
 
     def live_feed():
         while is_running:
-            ok, frame = camera.read_frame()
-            if ok:
-                msg_queue.put(('image', frame))
+            if camera.is_open():
+                ok, frame = camera.read_frame()
+                if ok:
+                    main_to_ui_queue.put(('image', frame))
             time.sleep(0.033)   # ~30 fps
 
     feed_thread = threading.Thread(target=live_feed, daemon=True)
     feed_thread.start()
 
-    # 6. Queue handler for session_start events (must patch session from main thread)
-    #    We intercept 'session_start' messages before the UI sees them.
-    original_get = msg_queue.get_nowait
-
-    def _intercept_session_start():
-        """Called by UI's check_queue → we hook session_start before UI side."""
-        pass  # Actual interception done in a monitor thread below
-
+    # 6. Queue handler for session_start and UI control events
     def session_monitor():
         """
-        Dedicated thread that watches for 'session_start' messages and
-        activates the session state.
+        Dedicated thread that watches for messages on ui_to_main_queue
+        and coordinates state updates.
         """
+        nonlocal is_running
         while is_running:
             try:
-                # Peek at queue without blocking
-                item = msg_queue.get_nowait()
+                # Block for a short time to allow check of is_running flag
+                item = ui_to_main_queue.get(timeout=0.2)
                 msg_type, data = item
 
                 if msg_type == 'session_start':
@@ -171,7 +177,7 @@ def main():
                     if saved_state and saved_state.get("product_name") == name:
                         session["product_num"] = saved_state["product_num"]
                         session["weld_index"]  = saved_state["weld_index"]
-                        msg_queue.put(('log', f"[RESUME] Resuming {name} at Product #{session['product_num']:03d}, Weld {session['weld_index']:02d}"))
+                        main_to_ui_queue.put(('log', f"[RESUME] Resuming {name} at Product #{session['product_num']:03d}, Weld {session['weld_index']:02d}"))
                     else:
                         session["product_num"] = 1
                         session["weld_index"]  = 1
@@ -180,15 +186,48 @@ def main():
                     session["active"]       = True
                     save_state()
 
-                    msg_queue.put(('show_monitor', None))
-                    msg_queue.put(('log', f"[SESSION] Started: {name}"))
-                    msg_queue.put(('status', (name, session["product_num"], session["weld_index"])))
-                else:
-                    # Put non-session items back
-                    msg_queue.put((msg_type, data))
+                    main_to_ui_queue.put(('show_monitor', None))
+                    main_to_ui_queue.put(('log', f"[SESSION] Started: {name}"))
+                    main_to_ui_queue.put(('status', (name, session["product_num"], session["weld_index"])))
+
+                    # Send initial camera status to UI
+                    cam_state = 'open' if camera.is_open() else 'closed'
+                    main_to_ui_queue.put(('camera_status', cam_state))
+
+                elif msg_type == 'camera_control':
+                    action = data
+                    if action == 'open':
+                        success = camera.open_camera()
+                        if success:
+                            if camera.camera_index != CAMERA_INDEX:
+                                msg = f"[SYSTEM] Camera index {CAMERA_INDEX} failed. Auto-detected and opened index {camera.camera_index}."
+                            else:
+                                msg = f"[SYSTEM] Camera connection opened (index {camera.camera_index})."
+                            main_to_ui_queue.put(('log', msg))
+                            main_to_ui_queue.put(('camera_status', 'open'))
+                        else:
+                            main_to_ui_queue.put(('log', f"[ERROR] Failed to open camera connection (tried index {CAMERA_INDEX} and fallbacks)."))
+                            main_to_ui_queue.put(('camera_status', 'failed'))
+                    elif action == 'close':
+                        camera.close_camera()
+                        main_to_ui_queue.put(('log', "[SYSTEM] Camera connection closed."))
+                        main_to_ui_queue.put(('camera_status', 'closed'))
+
+                elif msg_type == 'manual_trigger':
+                    main_to_ui_queue.put(('log', "[USER] Manual trigger event simulated."))
+                    on_robot_trigger()
+
+                elif msg_type == 'manual_product_done':
+                    main_to_ui_queue.put(('log', "[USER] Manual product cycle advance simulated."))
+                    on_product_done()
 
             except queue.Empty:
-                time.sleep(0.05)
+                continue
+            except Exception as e:
+                try:
+                    main_to_ui_queue.put(('log', f"[ERROR] monitor loop exception: {e}"))
+                except Exception:
+                    pass
 
     monitor_thread = threading.Thread(target=session_monitor, daemon=True)
     monitor_thread.start()
