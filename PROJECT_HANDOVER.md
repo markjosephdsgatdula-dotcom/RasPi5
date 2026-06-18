@@ -1,6 +1,6 @@
 # Weld Inspection System Handover
 
-This document contains everything needed to resume this project on a different PC. You can open a new chat with an AI coding assistant (like Gemini or Claude) at work, upload/paste this document, and they will be fully up to speed instantly.
+This document contains everything needed to resume this project on a different PC (e.g. at work). You can open a new chat with an AI coding assistant (like Gemini or Claude) at work, upload/paste this document, and they will be fully up to speed instantly.
 
 ---
 
@@ -19,9 +19,9 @@ weld_inspection_system/
 ├── README.md              # Original readme file
 └── src/
     ├── __init__.py
-    ├── camera_capture.py  # OpenCV capture & vertical orientation flip
-    ├── trigger_handler.py # gpiozero listening for robot signals
-    └── ui_app.py          # CustomTkinter dashboard GUI
+    ├── camera_capture.py  # OpenCV capture with dynamic open/close states
+    ├── trigger_handler.py # gpiozero listening for robot signals (with PC mock fallback)
+    └── ui_app.py          # CustomTkinter dashboard GUI with Tabview (Live Monitor & Gallery)
 ```
 
 ---
@@ -45,13 +45,13 @@ The UR10e operates at **24V digital I/O**, whereas the Raspberry Pi 5 operates a
 ### On your PC (For development / UI preview)
 1. Install Python dependencies:
    ```bash
-   pip install -r requirements.txt
+   pip install customtkinter pillow paramiko opencv-python
    ```
 2. Run the app:
    ```bash
    python main.py
    ```
-   *Note: It will show warnings that GPIO and the camera cannot be initialized (since you are on a PC), but the GUI will open and function normally for layout checks.*
+   *Note: It will show warnings that GPIO and the camera cannot be initialized (since you are on a PC), but the GUI will open and function normally in simulation/preview mode. You can toggle the camera (Open/Close) and simulate robot triggers manually.*
 
 ### Deploying & Running on the Pi 5
 1. Make sure your PC is connected to the same network as the Pi.
@@ -66,11 +66,15 @@ The UR10e operates at **24V digital I/O**, whereas the Raspberry Pi 5 operates a
 
 ## 4. Current Progress Status
 
-* **Phase 1 (Done & Verified):** Core UI dashboard, live video capture with vertical flip, image directory auto-creation, and local deploy script are fully working.
-* **Phase 2 (Code Complete, Awaiting Physical Testing):**
-  - **Auto-resuming Session:** Counters (product # and weld index) are saved to `session_state.json` on the Pi on every trigger. If the Pi reboots, it reads this file and resumes exactly where it left off.
-  - **Dynamic Folder Routing:** Weld point directories (e.g. `weldpoint_01/`, `weldpoint_02/`) are created on the fly during the first run. All subsequent product runs save images into their respective folders (e.g., `product_002.jpg` goes into `weldpoint_01/`).
-* **Next Task:** Perform physical loopback testing of the GPIO inputs on the Pi (shorting BCM 17/22 to 3.3V) and wire the optocoupler to the UR10e.
+* **Phase 1 (Done & Verified):** Core UI dashboard, live video capture with vertical flip, image directory auto-creation, local deploy script are fully working.
+* **Phase 2 (Completed & Deployed):**
+  - **Tabbed Dashboard**: Re-built the UI with a `ctk.CTkTabview` containing:
+    - **Live Monitor**: Displays live camera feed, a scrolling console log, and a canvas-drawn camera connection status LED (Green for connected, Red for closed/disconnected). Includes manual debugging override buttons to simulate robot triggers.
+    - **Inspection Gallery**: Scans `data/captured_images/` dynamically. The user can select a product lot and weld point to browse captured runs side-by-side using "Next" and "Previous" buttons.
+  - **Dynamic Camera Controls**: Added UI toggles to open/close the camera. Closing the camera releases the `/dev/video1` device resource so other applications can use it.
+  - **Refactored Queue Architecture**: Implemented a double-queue structure (`ui_to_main_queue` and `main_to_ui_queue`) to eliminate event peeking, race conditions, and CPU spinning.
+  - **Local Simulation**: Integrated try-except fallbacks for `gpiozero` so developers can test layouts on PCs.
+* **Current Task**: Collect training images using the system, transfer them to a PC, and prepare to implement an automatic labeling script using Meta's **MobileSAM** model to bypass manual polygon annotations.
 
 ---
 
@@ -83,11 +87,16 @@ Hi! I want to resume work on my Robotic Weld Inspection System project.
 Here is the summary of what we have done:
 - We built a Python app that runs on a Raspberry Pi 5.
 - It interfaces with a monochrome USB camera at /dev/video1 (requires vertical flip: cv2.flip(gray, 0)) and a UR10e Robot Arm via GPIO pins (BCM 17: trigger, BCM 27: confirm output, BCM 22: product done).
-- The folder structure automatically groups images of the same weld point together:
-  data/captured_images/{product_name}/weldpoint_{weld_index:02d}/product_{product_num:03d}_{timestamp}.jpg
-- It saves its session state in `session_state.json` after every trigger so that if it reboots, it resumes the exact product/weld counts.
-- We have a `deploy_script.py` that connects via SFTP using paramiko to deploy code to the Pi (IP: 192.168.11.35, user: rinkamarkmaaku) and launches main.py on DISPLAY=:0.
-- All code has been pushed to a GitHub repository at: https://github.com/markjosephdsgatdula-dotcom/Ras-PI-5-program.git
+- We implemented a tabbed CustomTkinter UI:
+  1. "Live Monitor" tab with live camera feed, a canvas status LED, and manual debug triggers.
+  2. "Inspection Gallery" tab which dynamically lists captured product runs by weld point so the operator can inspect and compare images.
+- We added dynamic camera controls to open/close the connection and release /dev/video1 when closed.
+- We refactored communication to use a double-queue system (ui_to_main_queue and main_to_ui_queue) for safety.
+- We successfully pushed the code to the GitHub repository: https://github.com/markjosephdsgatdula-dotcom/Ras-PI-5-program.git
 
-Please review the codebase, help me set up my local environment, and let's get ready to test the GPIO trigger signals.
+We are now ready to:
+1. Capture training images at work today.
+2. Develop a Python script (using MobileSAM / Segment Anything Model) to automatically generate the weld bead polygon boundaries (auto-labeling) so we don't have to trace them manually on Roboflow.
+
+Please review the codebase, and let's start writing the auto-labeling script.
 ```
