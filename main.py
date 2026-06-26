@@ -3,6 +3,7 @@ import time
 import threading
 import json
 import os
+from xmlrpc.server import SimpleXMLRPCServer
 from src.trigger_handler import TriggerHandler
 from src.camera_capture import CameraCapture
 from src.ui_app import WeldMonitoringUI
@@ -27,6 +28,7 @@ session = {
     "weld_index":   1,      # increments on each capture, resets on product-done
     "active":       False,  # True after operator clicks "Start Session"
 }
+session_lock = threading.Lock()
 
 
 def save_state():
@@ -73,52 +75,53 @@ def main():
     # ─── Callbacks (called from gpiozero background thread) ───────────────────
 
     def on_robot_trigger() -> bool:
-        """Fires when UR10e sends capture signal on BCM 17."""
-        if not session["active"]:
-            main_to_ui_queue.put(('log', "[WARNING] Trigger received but no session is active. Start a session first."))
-            return False
+        """Fires when UR10e sends capture signal on BCM 17 or via XML-RPC."""
+        with session_lock:
+            if not session["active"]:
+                main_to_ui_queue.put(('log', "[WARNING] Trigger received but no session is active. Start a session first."))
+                return False
 
-        if not camera.is_open():
-            main_to_ui_queue.put(('log', "[WARNING] Capture trigger received but camera is closed!"))
-            return False
+            if not camera.is_open():
+                main_to_ui_queue.put(('log', "[WARNING] Capture trigger received but camera is closed!"))
+                return False
 
-        weld_dir = os.path.join(
-            BASE_SAVE_DIR,
-            session["product_name"],
-            f"weldpoint_{session['weld_index']:02d}"
-        )
+            weld_dir = os.path.join(
+                BASE_SAVE_DIR,
+                session["product_name"],
+                f"weldpoint_{session['weld_index']:02d}"
+            )
 
-        main_to_ui_queue.put(('log', f"[TRIGGER] Capturing → {weld_dir}"))
+            main_to_ui_queue.put(('log', f"[TRIGGER] Capturing → {weld_dir}"))
 
-        success, filepath, img = camera.capture_image(
-            save_dir    = weld_dir,
-            product_num = session["product_num"]
-        )
+            success, filepath, img = camera.capture_image(
+                save_dir    = weld_dir,
+                product_num = session["product_num"]
+            )
 
-        if success:
-            main_to_ui_queue.put(('log', f"[SUCCESS] Saved: {os.path.basename(filepath)}"))
-            main_to_ui_queue.put(('image', img))
+            if success:
+                main_to_ui_queue.put(('log', f"[SUCCESS] Saved: {os.path.basename(filepath)}"))
+                main_to_ui_queue.put(('image', img))
 
-            # Advance weld index and persist
-            session["weld_index"] += 1
-            save_state()
-            main_to_ui_queue.put(('status', (session["product_name"],
-                                       session["product_num"],
-                                       session["weld_index"])))
-            return True
-        else:
-            main_to_ui_queue.put(('log', "[ERROR] Capture failed."))
-            return False
+                session["weld_index"] += 1
+                save_state()
+                main_to_ui_queue.put(('status', (session["product_name"],
+                                           session["product_num"],
+                                           session["weld_index"])))
+                return True
+            else:
+                main_to_ui_queue.put(('log', "[ERROR] Capture failed."))
+                return False
 
     def on_product_done():
-        """Fires when UR10e sends product-done signal on BCM 22."""
-        if not session["active"]:
-            return
+        """Fires when UR10e sends product-done signal on BCM 22 or via XML-RPC."""
+        with session_lock:
+            if not session["active"]:
+                return
 
-        old_num = session["product_num"]
-        session["product_num"]  += 1
-        session["weld_index"]    = 1
-        save_state()
+            old_num = session["product_num"]
+            session["product_num"]  += 1
+            session["weld_index"]    = 1
+            save_state()
 
         main_to_ui_queue.put(('log', f"[DONE] Product #{old_num:03d} complete → starting #{session['product_num']:03d}"))
         main_to_ui_queue.put(('status', (session["product_name"],
@@ -139,10 +142,38 @@ def main():
     except Exception as e:
         main_to_ui_queue.put(('log', f"[WARNING] GPIO init failed (expected if not on Pi): {e}"))
 
-    # 4. Build UI
+    # 4. XML-RPC Server
+    rpc_server = None
+    class RobotXMLRPCInterface:
+        def capture_weld(self) -> bool:
+            main_to_ui_queue.put(('log', "[XML-RPC] Received capture_weld request"))
+            return on_robot_trigger()
+
+        def trigger_capture(self) -> bool:
+            return self.capture_weld()
+
+        def cycle_complete(self) -> bool:
+            main_to_ui_queue.put(('log', "[XML-RPC] Received cycle_complete request"))
+            on_product_done()
+            return True
+
+        def product_done(self) -> bool:
+            return self.cycle_complete()
+
+    try:
+        rpc_server = SimpleXMLRPCServer(("0.0.0.0", 8000), logRequests=False, allow_none=True)
+        rpc_server.register_instance(RobotXMLRPCInterface())
+
+        rpc_thread = threading.Thread(target=rpc_server.serve_forever, daemon=True)
+        rpc_thread.start()
+        main_to_ui_queue.put(('log', "[INIT] XML-RPC server listening on port 8000"))
+    except Exception as e:
+        main_to_ui_queue.put(('log', f"[ERROR] Failed to start XML-RPC server: {e}"))
+
+    # 5. Build UI
     app = WeldMonitoringUI(main_to_ui_queue, ui_to_main_queue)
 
-    # 5. Live video feed thread
+    # 6. Live video feed thread
     is_running = True
 
     def live_feed():
@@ -156,7 +187,7 @@ def main():
     feed_thread = threading.Thread(target=live_feed, daemon=True)
     feed_thread.start()
 
-    # 6. Queue handler for session_start and UI control events
+    # 7. Queue handler for session_start and UI control events
     def session_monitor():
         """
         Dedicated thread that watches for messages on ui_to_main_queue
@@ -232,11 +263,14 @@ def main():
     monitor_thread = threading.Thread(target=session_monitor, daemon=True)
     monitor_thread.start()
 
-    # 7. Run UI main loop
+    # 8. Run UI main loop
     try:
         app.mainloop()
     finally:
         is_running = False
+        if rpc_server:
+            rpc_server.shutdown()
+            rpc_server.server_close()
         feed_thread.join(timeout=1.0)
         camera.release()
         print("System shutdown cleanly.")
